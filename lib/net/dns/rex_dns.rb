@@ -60,7 +60,7 @@ module Net # :nodoc:
           method = :send_tcp
         end
 
-        ans = eval "self.#{method.to_s}(packet,packet_data)"
+        ans = self.__send__(method,packet,packet_data)
 
         unless (ans and ans[0].length > 0)
           @logger.fatal "No response from nameservers list: aborting"
@@ -90,9 +90,9 @@ module Net # :nodoc:
         length = [packet_data.size].pack("n")
         @config[:nameservers].each do |ns|
           begin
-            buffer = ""
+            socket = nil
             @config[:tcp_timeout].timeout do
-              begin
+              catch "next nameserver" do
                 begin
                   socket = Rex::Socket::Tcp.create(
                     'PeerHost' => ns.to_s,
@@ -106,37 +106,55 @@ module Net # :nodoc:
                 next unless socket #
                 @logger.info "Contacting nameserver #{ns} port #{@config[:port]}"
                 socket.write(length+packet_data)
-                ans = socket.recv(Net::DNS::INT16SZ)
-                len = ans.unpack("n")[0]
+                got_something = false
+                loop do
+                  buffer = ""
+                  ans = socket.recv(Net::DNS::INT16SZ)
+                  if ans.size == 0
+                    if got_something
+                      break #Proper exit from loop
+                    else
+                      @logger.warn "Connection reset to nameserver #{ns}, trying next."
+                      throw "next nameserver"
+                    end
+                  end
+                  got_something = true
+                  len = ans.unpack("n")[0]
 
-                @logger.info "Receiving #{len} bytes..."
+                  @logger.info "Receiving #{len} bytes..."
 
-                if len == 0
-                  @logger.warn "Receiving 0 length packet from nameserver #{ns}, trying next."
-                  next
+                  if len == 0
+                    @logger.warn "Receiving 0 length packet from nameserver #{ns}, trying next."
+                    throw "next nameserver"
+                  end
+
+                  while (buffer.size < len)
+                    left = len - buffer.size
+                    temp,from = socket.recvfrom(left)
+                    buffer += temp
+                  end
+
+                  unless buffer.size == len
+                    @logger.warn "Malformed packet from nameserver #{ns}, trying next."
+                    throw "next nameserver"
+                  end
+                  if block_given?
+                    yield [buffer,["",@config[:port],ns.to_s,ns.to_s]]
+                  else
+                    return [buffer,["",@config[:port],ns.to_s,ns.to_s]]
+                  end
                 end
-
-                while (buffer.size < len)
-                  left = len - buffer.size
-                  temp,from = socket.recvfrom(left)
-                  buffer += temp
-                end
-
-                unless buffer.size == len
-                  @logger.warn "Malformed packet from nameserver #{ns}, trying next."
-                  next
-                end
-              ensure
-                socket.close if socket
               end
-            end
-            return [buffer,["",@config[:port],ns.to_s,ns.to_s]]
-          rescue Timeout::Error
-            @logger.warn "Nameserver #{ns} not responding within TCP timeout, trying next one"
-            next
-          end
-        end
-      end
+			end
+		  rescue Timeout::Error
+			  @logger.warn "Nameserver #{ns} not responding within TCP timeout, trying next one"
+			  next
+		  ensure
+			  socket.close if socket
+		  end
+		end
+		return nil
+	  end
 
       def send_udp(packet,packet_data)
         ans = nil
